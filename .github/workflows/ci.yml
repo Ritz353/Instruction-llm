@@ -1,0 +1,23 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e .
+      - run: python -m unittest discover -s tests -v
+      - run: instruction-llm --help
+      - run: instruction-llm train --model tiny --data examples/instructions.json --output outputs/smoke --epochs 1 --device cpu
+      - run: instruction-llm generate --checkpoint outputs/smoke/model.pt --prompt 'Say hello.' --max-new-tokens 5 --device cpu
+      - run: python -m pip wheel . --no-deps --wheel-dir dist

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instruction-llm"
+version = "0.1.0"
+description = "A transparent GPT-2 instruction-finetuning toolkit in PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE.txt"}
+dependencies = ["torch>=2.6,<3", "tiktoken>=0.7,<1", "numpy>=1.26,<3", "matplotlib>=3.8,<4", "requests>=2.32,<3", "tqdm>=4.66,<5"]
+
+[project.optional-dependencies]
+pretrained = ["tensorflow>=2.16,<3"]
+
+[project.scripts]
+instruction-llm = "instruction_llm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

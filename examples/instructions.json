@@ -1,0 +1,8 @@
+[
+  {"instruction": "Say hello politely.", "input": "", "output": "Hello! How can I help you today?"},
+  {"instruction": "Rewrite this sentence in the past tense.", "input": "I walk to the library.", "output": "I walked to the library."},
+  {"instruction": "Name two primary colors.", "input": "", "output": "Red and blue."},
+  {"instruction": "Summarize the text in a few words.", "input": "Rain fell all morning, so we stayed inside and read books.", "output": "We read indoors during the rain."},
+  {"instruction": "Give the opposite of the word.", "input": "cold", "output": "Hot."},
+  {"instruction": "Make this request more polite.", "input": "Give me the notebook.", "output": "Could you please give me the notebook?"}
+]

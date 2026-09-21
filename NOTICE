@@ -1,0 +1,15 @@
+Instruction LLM
+
+This project includes code from Build a Large Language Model (From Scratch)
+by Sebastian Raschka, https://github.com/rasbt/LLMs-from-scratch,
+licensed under Apache License 2.0. Original copyright headers are retained.
+
+src/instruction_llm/model.py: copied from ch07/01_main-chapter-code/previous_chapters.py.
+src/instruction_llm/gpt_download.py: copied from ch07/01_main-chapter-code/gpt_download.py.
+src/instruction_llm/data.py: extracted and modified from
+ch07/01_main-chapter-code/gpt_instruction_finetuning.py.
+
+Package structure, CLI, tests, documentation, and example records were added
+for this distribution. This is a derivative project, not an official release
+or endorsement by the upstream author. The example dataset is synthetic
+smoke-test material. Pretrained weights are downloaded separately.
