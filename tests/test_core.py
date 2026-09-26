@@ -15,15 +15,18 @@ class CoreTests(unittest.TestCase):
         torch.manual_seed(123)
         torch.set_num_threads(1)
 
-    def test_padding_preserves_one_eos_target(self):
-        inputs, targets = custom_collate_fn([[7, 8], [9]])
-        self.assertEqual(inputs.tolist(), [[7, 8], [9, 50256]])
-        self.assertEqual(targets.tolist(), [[8, 50256], [50256, -100]])
+    def test_response_only_loss_and_padding(self):
+        batch = [([7, 8], [9, 10]), ([11, 12], [13])]
+        inputs, targets = custom_collate_fn(batch)
+        self.assertEqual(inputs.tolist(), [[7, 8, 9, 10], [11, 12, 13, 50256]])
+        self.assertEqual(targets.tolist(),
+                         [[-100, 9, 10, 50256], [-100, 13, 50256, -100]])
 
-    def test_truncation(self):
-        inputs, targets = custom_collate_fn([[1, 2, 3]], allowed_max_length=2)
-        self.assertEqual(inputs.tolist(), [[1, 2]])
-        self.assertEqual(targets.tolist(), [[2, 3]])
+    def test_truncation_preserves_response(self):
+        inputs, targets = custom_collate_fn(
+            [([1, 2, 3, 4], [5, 6])], allowed_max_length=4)
+        self.assertEqual(inputs.shape, (1, 4))
+        self.assertEqual(targets[0].tolist(), [-100, 5, 6, 50256])
 
     def test_data_validation_and_optional_input(self):
         with tempfile.TemporaryDirectory() as directory:

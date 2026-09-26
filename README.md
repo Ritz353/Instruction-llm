@@ -84,6 +84,26 @@ the full prompt plus response. Sequences are truncated to model context length
 shorter records before training. The tiny demonstration dataset is not suitable
 for quality evaluation. Maintain a separate untouched test set.
 
+## Reducing repetition
+
+Generation now applies a repetition penalty of 1.15 and blocks repeated
+4-token sequences within the response by default. Existing checkpoints work
+without retraining. The prompt is excluded from these controls so the model
+can still quote your input. End-of-text remains available to finish an answer.
+
+To adjust the controls or enable sampling:
+
+```bash
+instruction-llm generate --checkpoint outputs/run-001/model.pt --prompt "Explain gravity briefly." --repetition-penalty 1.2 --no-repeat-ngram-size 4 --temperature 0.7 --top-k 50
+```
+
+Temperature defaults to 0 (deterministic decoding). Set
+`--repetition-penalty 1 --no-repeat-ngram-size 0` to disable the controls,
+for example when generating code or text that intentionally repeats.
+The sequence guard operates on tokens, not words, and may affect phrasing.
+These controls reduce output loops; they do not fix poor training or guarantee
+factual answers.
+
 ## Repository layout
 
 ```text

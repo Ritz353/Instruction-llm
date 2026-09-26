@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import random
 from functools import partial
 from pathlib import Path
@@ -70,36 +71,101 @@ def train(args):
         _, params = download_and_load_gpt2(args.model, args.cache_dir)
         load_weights_into_gpt(model, params)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=0.1,
+    )
+
+    # Several small batches now act like one larger batch without requiring
+    # the full effective batch to fit in GPU memory at once.
+    accumulation_steps = args.gradient_accumulation_steps
+    updates_per_epoch = math.ceil(len(loaders[0]) / accumulation_steps)
+    total_updates = updates_per_epoch * args.epochs
+    warmup_updates = max(1, int(total_updates * 0.03))
+
+    def learning_rate_multiplier(step):
+        if step < warmup_updates:
+            return (step + 1) / warmup_updates
+        decay_steps = max(1, total_updates - warmup_updates)
+        progress = min(1.0, (step - warmup_updates) / decay_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=learning_rate_multiplier,
+    )
     history = []
+    best_validation = float("inf")
+    best_epoch = 0
+    best_state = None
+
     for epoch in range(args.epochs):
         model.train()
         total = 0.0
-        for inputs, targets in loaders[0]:
-            optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_index, (inputs, targets) in enumerate(loaders[0]):
             loss = calc_loss_batch(inputs, targets, model, device)
             if not torch.isfinite(loss):
                 raise ValueError("Training loss is non-finite; reduce the learning rate.")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+
+            # Scaling keeps accumulated gradients comparable to a normal
+            # larger-batch average.
+            (loss / accumulation_steps).backward()
             total += loss.item()
+
+            update_due = (batch_index + 1) % accumulation_steps == 0
+            final_batch = batch_index + 1 == len(loaders[0])
+            if update_due or final_batch:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
         model.eval()
         with torch.inference_mode():
             validation = calc_loss_loader(loaders[1], model, device)
-        metrics = dict(epoch=epoch + 1, train_loss=total / len(loaders[0]), val_loss=validation)
+
+        metrics = {
+            "epoch": epoch + 1,
+            "train_loss": total / len(loaders[0]),
+            "val_loss": validation,
+            "learning_rate": scheduler.get_last_lr()[0],
+        }
         history.append(metrics)
         print(json.dumps(metrics), flush=True)
+
+        # Keep a CPU copy of the epoch that generalizes best instead of
+        # automatically saving the possibly overfit final epoch.
+        if validation < best_validation:
+            best_validation = validation
+            best_epoch = epoch + 1
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+
     output.mkdir(parents=True, exist_ok=True)
-    metadata = {"model": args.model, "seed": args.seed, "epochs": args.epochs,
-                "batch_size": args.batch_size, "learning_rate": args.learning_rate,
-                "device": device, "torch_version": str(torch.__version__),
-                "data_sha256": hashlib.sha256(Path(args.data).read_bytes()).hexdigest(),
-                "train_records": split, "validation_records": len(records) - split,
-                "history": history}
+    metadata = {
+        "model": args.model,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "effective_batch_size": args.batch_size * accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "best_epoch": best_epoch,
+        "best_validation_loss": best_validation,
+        "device": device,
+        "torch_version": str(torch.__version__),
+        "data_sha256": hashlib.sha256(Path(args.data).read_bytes()).hexdigest(),
+        "train_records": split,
+        "validation_records": len(records) - split,
+        "history": history,
+    }
     torch.save({"format_version": 1, "config": cfg,
-                "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-                "metadata": metadata}, output / "model.pt")
+                "state_dict": best_state, "metadata": metadata}, output / "model.pt")
     (output / "metrics.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"Saved checkpoint: {output / 'model.pt'}")
 
@@ -123,7 +189,10 @@ def respond(args):
         raise ValueError("Prompt exceeds this model's context length; shorten the prompt or input.")
     with torch.inference_mode():
         tokens = generate(model, torch.tensor([ids], device=device), args.max_new_tokens,
-                          cfg["context_length"], eos_id=50256)
+                          cfg["context_length"], eos_id=50256,
+                          temperature=args.temperature, top_k=args.top_k,
+                          repetition_penalty=args.repetition_penalty,
+                          no_repeat_ngram_size=args.no_repeat_ngram_size)
     print(tokenizer.decode(tokens[0, len(ids):].tolist()).strip())
 
 
@@ -136,6 +205,10 @@ def main():
     training.add_argument("--model", choices=["tiny", *SIZES], default="124M")
     training.add_argument("--epochs", type=positive, default=2)
     training.add_argument("--batch-size", type=positive, default=2)
+    training.add_argument(
+        "--gradient-accumulation-steps", type=positive, default=16,
+        help="Accumulate this many batches before each optimizer update (default: 16).",
+    )
     training.add_argument("--learning-rate", type=float, default=5e-5)
     training.add_argument("--seed", type=int, default=123)
     training.add_argument("--cache-dir", default=".cache/gpt2")
@@ -145,6 +218,14 @@ def main():
     inference.add_argument("--prompt", required=True)
     inference.add_argument("--input", default="")
     inference.add_argument("--max-new-tokens", type=positive, default=128)
+    inference.add_argument("--temperature", type=float, default=0.0,
+                           help="Sampling temperature; 0 uses deterministic decoding (default).")
+    inference.add_argument("--top-k", type=positive, default=50,
+                           help="Sample from the top K tokens with positive temperature (default: 50).")
+    inference.add_argument("--repetition-penalty", type=float, default=1.15,
+                           help="Penalize response tokens already used; 1 disables (default: 1.15).")
+    inference.add_argument("--no-repeat-ngram-size", type=int, default=4,
+                           help="Block repeated response token sequences; 0 disables (default: 4).")
     inference.set_defaults(func=respond)
     for sub in (training, inference):
         sub.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")

@@ -14,16 +14,20 @@ from torch.utils.data import Dataset
 class InstructionDataset(Dataset):
     def __init__(self, data, tokenizer):
         self.data = data
-
-        # Pre-tokenize texts
         self.encoded_texts = []
         for entry in data:
-            instruction_plus_input = format_input(entry)
-            response_text = f"\n\n### Response:\n{entry['output']}"
-            full_text = instruction_plus_input + response_text
-            self.encoded_texts.append(
-                tokenizer.encode(full_text)
+            # The prompt is context for the model, not a prediction target.
+            prompt_text = (
+                format_input(entry)
+                + "\n\n### Response:\n"
             )
+            response_text = entry["output"]
+
+            prompt_ids = tokenizer.encode(prompt_text)
+            response_ids = tokenizer.encode(response_text)
+
+            # Keeping the sections separate lets the collator mask the prompt.
+            self.encoded_texts.append((prompt_ids, response_ids))
 
     def __getitem__(self, index):
         return self.encoded_texts[index]
@@ -31,49 +35,98 @@ class InstructionDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+def _shorten_prompt(prompt_ids, maximum_length):
+    """Keep the start and end of an oversized prompt."""
+    if len(prompt_ids) <= maximum_length:
+        return prompt_ids
+
+    beginning_length = maximum_length // 2
+    ending_length = maximum_length - beginning_length
+
+    return (
+        prompt_ids[:beginning_length]
+        + prompt_ids[-ending_length:]
+    )
 
 def custom_collate_fn(
     batch,
     pad_token_id=50256,
     ignore_index=-100,
     allowed_max_length=None,
-    device="cpu"
+    device="cpu",
 ):
-    # Find the longest sequence in the batch
-    batch_max_length = max(len(item)+1 for item in batch)
+    prepared_examples = []
 
-    # Pad and prepare inputs and targets
-    inputs_lst, targets_lst = [], []
+    for prompt_ids, response_ids in batch:
+        prompt_ids = prompt_ids.copy()
+        response_ids = response_ids.copy()
 
-    for item in batch:
-        new_item = item.copy()
-        # Add an <|endoftext|> token
-        new_item += [pad_token_id]
-        # Pad sequences to max_length
-        padded = new_item + [pad_token_id] * (batch_max_length - len(new_item))
-        inputs = torch.tensor(padded[:-1])  # Truncate the last token for inputs
-        targets = torch.tensor(padded[1:])  # Shift +1 to the right for targets
-
-        # New: Replace all but the first padding tokens in targets by ignore_index
-        mask = targets == pad_token_id
-        indices = torch.nonzero(mask).squeeze()
-        if indices.numel() > 1:
-            targets[indices[1:]] = ignore_index
-
-        # New: Optionally truncate to maximum sequence length
         if allowed_max_length is not None:
-            inputs = inputs[:allowed_max_length]
-            targets = targets[:allowed_max_length]
+            if allowed_max_length < 2:
+                raise ValueError(
+                    "allowed_max_length must be at least 2."
+                )
 
-        inputs_lst.append(inputs)
-        targets_lst.append(targets)
+            # Leave room for at least one prompt token. Very long
+            # responses must still be shortened to fit the model.
+            maximum_response_length = allowed_max_length - 1
+            response_ids = response_ids[:maximum_response_length]
 
-    # Convert list of inputs and targets to tensors and transfer to target device
-    inputs_tensor = torch.stack(inputs_lst).to(device)
-    targets_tensor = torch.stack(targets_lst).to(device)
+            # Give the remaining context space to the prompt.
+            prompt_budget = allowed_max_length - len(response_ids)
+            prompt_ids = _shorten_prompt(
+                prompt_ids,
+                max(1, prompt_budget),
+            )
+
+        response_start = len(prompt_ids)
+        token_ids = prompt_ids + response_ids
+
+        prepared_examples.append(
+            (token_ids, response_start)
+        )
+
+    # Add one position for the end-of-text token.
+    batch_max_length = max(
+        len(token_ids) + 1
+        for token_ids, _ in prepared_examples
+    )
+
+    inputs_list = []
+    targets_list = []
+
+    for token_ids, response_start in prepared_examples:
+        # End every response with GPT-2's end-of-text token.
+        token_ids = token_ids + [pad_token_id]
+
+        padded = token_ids + [pad_token_id] * (
+            batch_max_length - len(token_ids)
+        )
+
+        # Input token N is trained to predict target token N + 1.
+        inputs = torch.tensor(padded[:-1])
+        targets = torch.tensor(padded[1:])
+
+        # Ignore prompt targets. The first response token appears at
+        # target position response_start - 1.
+        prompt_target_count = max(0, response_start - 1)
+        targets[:prompt_target_count] = ignore_index
+
+        # Keep the real end-of-text target but ignore padding after it.
+        padding_indices = torch.nonzero(
+            targets == pad_token_id
+        ).flatten()
+
+        if padding_indices.numel() > 1:
+            targets[padding_indices[1:]] = ignore_index
+
+        inputs_list.append(inputs)
+        targets_list.append(targets)
+
+    inputs_tensor = torch.stack(inputs_list).to(device)
+    targets_tensor = torch.stack(targets_list).to(device)
 
     return inputs_tensor, targets_tensor
-
 
 def format_input(entry):
     instruction_text = (

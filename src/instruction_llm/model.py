@@ -8,6 +8,7 @@
 # This file can be run as a standalone script.
 
 
+import math
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import numpy as np
@@ -247,7 +248,19 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 #####################################
 # Chapter 5
 #####################################
-def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None,
+             repetition_penalty=1.0, no_repeat_ngram_size=0):
+    """Decode with optional response-only repetition controls."""
+    if not math.isfinite(repetition_penalty) or repetition_penalty < 1:
+        raise ValueError("repetition_penalty must be finite and at least 1.")
+    if not isinstance(no_repeat_ngram_size, int) or no_repeat_ngram_size < 0:
+        raise ValueError("no_repeat_ngram_size must be a nonnegative integer.")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative.")
+    if top_k is not None and (not isinstance(top_k, int) or top_k < 1):
+        raise ValueError("top_k must be a positive integer or None.")
+    prompt_length = idx.shape[1]
+    finished = torch.zeros(idx.shape[0], dtype=torch.bool, device=idx.device)
 
     # For-loop is the same as before: Get logits, and only focus on last time step
     for _ in range(max_new_tokens):
@@ -256,11 +269,36 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
             logits = model(idx_cond)
         logits = logits[:, -1, :]
 
-        # New: Filter logits with top_k sampling
+        # Track the full response even after the context window slides.
+        # Exclude the prompt so quoting user input remains possible.
+        logits = logits.clone()
+        for row in range(idx.shape[0]):
+            generated = idx[row, prompt_length:]
+            seen = generated.unique()
+            if eos_id is not None:
+                seen = seen[seen != eos_id]
+            scores = logits[row, seen]
+            logits[row, seen] = torch.where(
+                scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+            n = no_repeat_ngram_size
+            if n and generated.numel() >= n:
+                history = generated.tolist()
+                prefix = history[-(n - 1):] if n > 1 else []
+                banned = {history[i + n - 1] for i in range(len(history) - n + 1)
+                          if history[i:i + n - 1] == prefix}
+                banned.discard(eos_id)
+                if banned:
+                    logits[row, list(banned)] = -torch.inf
+            if not torch.isfinite(logits[row]).any():
+                if eos_id is None:
+                    raise ValueError("Repetition constraints blocked every token; relax them or set eos_id.")
+                logits[row, eos_id] = 0
+
+        # Filter after repetition controls so alternatives remain available.
         if top_k is not None:
             # Keep only top_k values
-            top_logits, _ = torch.topk(logits, top_k)
-            min_val = top_logits[:, -1]
+            top_logits, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
+            min_val = top_logits[:, -1:]
             logits = torch.where(logits < min_val, torch.tensor(float("-inf")).to(logits.device), logits)
 
         # New: Apply temperature scaling
@@ -281,8 +319,11 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
         else:
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
 
-        if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
-            break
+        if eos_id is not None:
+            idx_next[finished] = eos_id
+            finished |= idx_next.squeeze(-1) == eos_id
+            if finished.all():
+                break
 
         # Same as before: append sampled index to the running sequence
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
